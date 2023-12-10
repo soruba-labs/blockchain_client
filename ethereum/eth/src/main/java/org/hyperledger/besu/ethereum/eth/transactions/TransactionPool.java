@@ -30,6 +30,9 @@ import org.hyperledger.besu.ethereum.chain.MutableBlockchain;
 import org.hyperledger.besu.ethereum.core.BlockHeader;
 import org.hyperledger.besu.ethereum.core.MiningParameters;
 import org.hyperledger.besu.ethereum.core.Transaction;
+import org.hyperledger.besu.ethereum.core.encoding.TransactionEncoder;
+import org.hyperledger.besu.ethereum.core.encoding.EncodingContext;
+import org.hyperledger.besu.ethereum.eth.authtxservice.AuthTxService;
 import org.hyperledger.besu.ethereum.eth.manager.EthContext;
 import org.hyperledger.besu.ethereum.eth.manager.EthPeer;
 import org.hyperledger.besu.ethereum.mainnet.ProtocolSchedule;
@@ -114,6 +117,8 @@ public class TransactionPool implements BlockAddedObserver {
   private final Set<Address> localSenders = ConcurrentHashMap.newKeySet();
   private final Lock blockAddedLock = new ReentrantLock();
   private final Queue<BlockAddedEvent> blockAddedQueue = new ConcurrentLinkedQueue<>();
+  // Soruba
+  private Optional<AuthTxService> authTxService = Optional.empty();
 
   public TransactionPool(
       final Supplier<PendingTransactions> pendingTransactionsSupplier,
@@ -176,6 +181,33 @@ public class TransactionPool implements BlockAddedObserver {
   public ValidationResult<TransactionInvalidReason> addTransactionViaApi(
       final Transaction transaction) {
 
+    // Soruba
+    final String rawTransaction = TransactionEncoder.encodeOpaqueBytes(transaction, EncodingContext.POOLED_TRANSACTION).toHexString();
+    // LOG.info("==>>>> {}", rawTransaction);
+
+    boolean routeTransactionViaAuth =
+        authTxService.isPresent()
+            && !authTxService.get().isPassiveMode()
+            && !authTxService.get().isTransactionAuthorizedByProtocol(transaction);
+
+    if (routeTransactionViaAuth) {
+      final boolean hasPriority = isPriorityTransaction(transaction, true);
+
+      final ValidationResultAndAccount validationResult = validateTransaction(transaction, true, hasPriority);
+
+      if (validationResult.result.isValid()) {
+        // FIXME: How check if exist, replaced? (Needed to return invalid transaction)
+        LOG.info(
+            "Handled local transaction ({}) for AuthTxService with payload of {}.",
+            transaction.getHash().toString(),
+            transaction);
+
+        authTxService.get().publishMessage(transaction, rawTransaction);
+      }
+
+      return validationResult.result;
+    }
+   
     final var result = addTransaction(transaction, true);
     if (result.isValid()) {
       localSenders.add(transaction.getSender());
@@ -245,6 +277,24 @@ public class TransactionPool implements BlockAddedObserver {
         validateTransaction(transaction, isLocal, hasPriority);
 
     if (validationResult.result.isValid()) {
+
+      // //Soruba
+      // if (transaction.getType().equals(TransactionType.AUTH_SERVICE) && transaction.getRejectedReason().isPresent()) {
+      //   String _rejectReason = new String(transaction.getRejectedReason().get().toArray(), StandardCharsets.UTF_8);
+ 
+      //   final var rejectReason = ValidationResult.invalid(
+      //             INTERNAL_ERROR,
+      //             _rejectReason);
+
+      //   LOG.atTrace()
+      //       .setMessage("Transaction {} rejected reason {}")
+      //       .addArgument(transaction::toTraceLog)
+      //       .addArgument(rejectReason)
+      //       .log();
+      //   metrics.incrementRejected(isLocal, hasPriority, rejectReason.getInvalidReason(), "txpool");
+      //   return rejectReason;
+      // }
+
       final TransactionAddedResult status =
           pendingTransactions.addTransaction(
               PendingTransaction.newPendingTransaction(transaction, isLocal, hasPriority),
@@ -290,6 +340,22 @@ public class TransactionPool implements BlockAddedObserver {
     return validationResult.result;
   }
 
+  // Soruba
+  /** Receive and decode transaction via AuthTxService */
+  public ValidationResult<TransactionInvalidReason> addLocalTransactionViaAuth(final Transaction transaction) {
+    LOG.info(
+            "Received transaction ({}) from AuthTxService with payload of {}.",
+            transaction.getHash().toString(),
+            transaction);
+    final var result = addTransaction(transaction, true);
+
+    if (result.isValid()) {
+      localSenders.add(transaction.getSender());
+      transactionBroadcaster.onTransactionsAdded(List.of(transaction));
+    }
+    return result;
+  }
+
   private Optional<Wei> getMaxGasPrice(final Transaction transaction) {
     return transaction.getGasPrice().map(Optional::of).orElse(transaction.getMaxFeePerGas());
   }
@@ -328,6 +394,16 @@ public class TransactionPool implements BlockAddedObserver {
 
   public void unsubscribeDroppedTransactions(final long id) {
     pendingTransactionsListenersProxy.onDroppedListeners.unsubscribe(id);
+  }
+
+  // Soruba
+  /** Set auth transaction service for push messaging */
+  public void setAuthPublishService(final AuthTxService authTxService) {
+    this.authTxService = Optional.of(authTxService);
+  }
+
+  public AuthTxService getAuthPublishService() {
+    return this.authTxService.get();
   }
 
   @Override
